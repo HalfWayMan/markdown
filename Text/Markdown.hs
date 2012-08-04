@@ -5,6 +5,7 @@ module Text.Markdown
       -- * Settings
     , MarkdownSettings
     , msXssProtect
+    , msBlockLimit
       -- * Newtype
     , Markdown (..)
       -- * Convenience re-exports.
@@ -35,11 +36,14 @@ import qualified Data.Map as Map
 data MarkdownSettings = MarkdownSettings
     { msXssProtect :: Bool
       -- ^ Whether to automatically apply XSS protection to embedded HTML. Default: @True@.
+    , msBlockLimit :: Maybe Int
+      -- ^ Whether to limit the number of blocks that are rendered. Useful for document previews.
     }
 
 instance Default MarkdownSettings where
     def = MarkdownSettings
         { msXssProtect = True
+        , msBlockLimit = Nothing
         }
 
 -- | A newtype wrapper providing a @ToHtml@ instance.
@@ -67,7 +71,7 @@ markdown ms tl = runIdentity
     fixBlock = fmap $ toHtmlI ms . toInline refs
 
     blocksH :: [Block Html]
-    blocksH = map fixBlock blocks
+    blocksH = maybe id take (msBlockLimit ms) $ map fixBlock blocks
 
     blocks :: [Block Text]
     blocks = runIdentity

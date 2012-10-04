@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Text.Markdown
     ( -- * Functions
       markdown
@@ -8,7 +9,7 @@ module Text.Markdown
     , msBlockLimit
       -- * Newtype
     , Markdown (..)
-      -- * Convenience re-exports.
+      -- * Convenience re-exports
     , def
     ) where
 
@@ -28,6 +29,7 @@ import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as HA
 import Text.HTML.SanitizeXSS (sanitizeBalance)
 import qualified Data.Map as Map
+import Data.String (IsString)
 
 -- | A settings type providing various configuration options.
 --
@@ -48,6 +50,7 @@ instance Default MarkdownSettings where
 
 -- | A newtype wrapper providing a @ToHtml@ instance.
 newtype Markdown = Markdown TL.Text
+  deriving(Monoid, IsString)
 
 instance ToMarkup Markdown where
     toMarkup (Markdown t) = markdown def t

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE Rank2Types #-}
 {-# OPTIONS_HADDOCK hide #-}
 module Text.Markdown.Block
     ( Block (..)

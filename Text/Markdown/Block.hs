@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE Rank2Types #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_HADDOCK hide #-}
 module Text.Markdown.Block
     ( Block (..)
@@ -10,42 +11,30 @@ module Text.Markdown.Block
     ) where
 
 import Prelude
+#if MIN_VERSION_conduit(1, 0, 0)
 import Data.Conduit
+#else
+import Data.Conduit hiding ((=$=))
+import Data.Conduit.Internal (pipeL)
+#endif
 import qualified Data.Conduit.Text as CT
 import qualified Data.Conduit.List as CL
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Functor.Identity (runIdentity)
 import Data.Char (isDigit)
+import Text.Markdown.Types
+import qualified Data.Set as Set
+import qualified Data.Map as Map
 
-data ListType = Ordered | Unordered
-  deriving (Show, Eq)
+#if !MIN_VERSION_conduit(1, 0, 0)
+(=$=) :: Monad m => Pipe a a b x m y -> Pipe b b c y m z -> Pipe a a c x m z
+(=$=) = pipeL
+#endif
 
-data Block inline
-    = BlockPara inline
-    | BlockList ListType (Either inline [Block inline])
-    | BlockCode (Maybe Text) Text
-    | BlockQuote [Block inline]
-    | BlockHtml Text
-    | BlockRule
-    | BlockHeading Int inline
-    | BlockReference Text Text
-  deriving (Show, Eq)
-
-instance Functor Block where
-    fmap f (BlockPara i) = BlockPara (f i)
-    fmap f (BlockList lt (Left i)) = BlockList lt $ Left $ f i
-    fmap f (BlockList lt (Right bs)) = BlockList lt $ Right $ map (fmap f) bs
-    fmap _ (BlockCode a b) = BlockCode a b
-    fmap f (BlockQuote bs) = BlockQuote $ map (fmap f) bs
-    fmap _ (BlockHtml t) = BlockHtml t
-    fmap _ BlockRule = BlockRule
-    fmap f (BlockHeading level i) = BlockHeading level (f i)
-    fmap _ (BlockReference x y) = BlockReference x y
-
-toBlocks :: Monad m => Conduit Text m (Block Text)
-toBlocks =
-    mapOutput fixWS CT.lines =$= toBlocksLines
+toBlocks :: Monad m => MarkdownSettings -> Conduit Text m (Block Text)
+toBlocks ms =
+    mapOutput fixWS CT.lines =$= toBlocksLines ms
   where
     fixWS = T.pack . go 0 . T.unpack
 
@@ -57,15 +46,15 @@ toBlocks =
         j = 4 - (i `mod` 4)
     go i (c:cs) = c : go (i + 1) cs
 
-toBlocksLines :: Monad m => Conduit Text m (Block Text)
-toBlocksLines = awaitForever start =$= tightenLists
+toBlocksLines :: Monad m => MarkdownSettings -> Conduit Text m (Block Text)
+toBlocksLines ms = awaitForever (start ms) =$= tightenLists
 
-tightenLists :: Monad m => GLInfConduit (Either Blank (Block Text)) m (Block Text)
+tightenLists :: Monad m => Conduit (Either Blank (Block Text)) m (Block Text)
 tightenLists =
     go Nothing
   where
     go mTightList =
-        awaitE >>= either return go'
+        await >>= maybe (return ()) go'
       where
         go' (Left Blank) = go mTightList
         go' (Right (BlockList ltNew contents)) =
@@ -97,62 +86,160 @@ tightenLists =
 
 data Blank = Blank
 
-start :: Monad m => Text -> GLConduit Text m (Either Blank (Block Text))
-start t
-    | T.null $ T.strip t = yield $ Left Blank
-    | Just lang <- T.stripPrefix "~~~" t = do
-        (finished, ls) <- takeTill (== "~~~") >+> withUpstream CL.consume
+data LineType = LineList ListType Text
+              | LineCode Text
+              | LineFenced Text FencedHandler -- ^ terminator, language
+              | LineBlockQuote Text
+              | LineHeading Int Text
+              | LineBlank
+              | LineText Text
+              | LineRule
+              | LineHtml Text
+              | LineReference Text Text -- ^ name, destination
+
+lineType :: MarkdownSettings -> Text -> LineType
+lineType ms t
+    | T.null $ T.strip t = LineBlank
+    | Just (term, fh) <- getFenced (Map.toList $ msFencedHandlers ms) t = LineFenced term fh
+    | Just t' <- T.stripPrefix "> " t = LineBlockQuote t'
+    | Just (level, t') <- stripHeading t = LineHeading level t'
+    | Just t' <- T.stripPrefix "    " t = LineCode t'
+    | isRule t = LineRule
+    | isHtmlStart t = LineHtml t
+    | Just (ltype, t') <- listStart t = LineList ltype t'
+    | Just (name, dest) <- getReference t = LineReference name dest
+    | otherwise = LineText t
+  where
+    getFenced [] _ = Nothing
+    getFenced ((x, fh):xs) t'
+        | Just rest <- T.stripPrefix x t' = Just (x, fh $ T.strip rest)
+        | otherwise = getFenced xs t'
+
+    isRule :: Text -> Bool
+    isRule =
+        go . T.strip
+      where
+        go "* * *" = True
+        go "***" = True
+        go "*****" = True
+        go "- - -" = True
+        go "---" = True
+        go "___" = True
+        go "_ _ _" = True
+        go t' = T.length (T.takeWhile (== '-') t') >= 5
+
+    stripHeading :: Text -> Maybe (Int, Text)
+    stripHeading t'
+        | T.null x = Nothing
+        | otherwise = Just (T.length x, T.strip $ T.dropWhileEnd (== '#') y)
+      where
+        (x, y) = T.span (== '#') t'
+
+    getReference :: Text -> Maybe (Text, Text)
+    getReference a = do
+        b <- T.stripPrefix "[" $ T.dropWhile (== ' ') a
+        let (name, c) = T.break (== ']') b
+        d <- T.stripPrefix "]:" c
+        Just (name, T.strip d)
+
+start :: Monad m => MarkdownSettings -> Text -> Conduit Text m (Either Blank (Block Text))
+start ms t =
+    go $ lineType ms t
+  where
+    go LineBlank = yield $ Left Blank
+    go (LineFenced term fh) = do
+        (finished, ls) <- takeTillConsume (== term)
         case finished of
-            Just _ -> yield $ Right $ BlockCode (if T.null lang then Nothing else Just lang) $ T.intercalate "\n" ls
+            Just _ -> do
+                let block =
+                        case fh of
+                            FHRaw fh' -> fh' $ T.intercalate "\n" ls
+                            FHParsed fh' -> fh' $ runIdentity $ mapM_ yield ls $$ toBlocksLines ms =$ CL.consume
+                mapM_ (yield . Right) block
             Nothing -> mapM_ leftover (reverse $ T.cons ' ' t : ls)
-    | Just lang <- T.stripPrefix "```" t = do
-        (finished, ls) <- takeTill (== "```") >+> withUpstream CL.consume
-        case finished of
-            Just _ -> yield $ Right $ BlockCode (if T.null lang then Nothing else Just lang) $ T.intercalate "\n" ls
-            Nothing -> mapM_ leftover (reverse $ T.cons ' ' t : ls)
-    | Just t' <- T.stripPrefix "> " t = do
-        ls <- takeQuotes >+> CL.consume
-        let blocks = runIdentity $ mapM_ yield (t' : ls) $$ toBlocksLines =$ CL.consume
+    go (LineBlockQuote t') = do
+        ls <- takeQuotes =$= CL.consume
+        let blocks = runIdentity $ mapM_ yield (t' : ls) $$ toBlocksLines ms =$ CL.consume
         yield $ Right $ BlockQuote blocks
-    | Just (level, t') <- stripHeading t = yield $ Right $ BlockHeading level t'
-    | Just t' <- T.stripPrefix "    " t = do
-        ls <- getIndented 4 >+> CL.consume
+    go (LineHeading level t') = yield $ Right $ BlockHeading level t'
+    go (LineCode t') = do
+        ls <- getIndented 4 =$= CL.consume
         yield $ Right $ BlockCode Nothing $ T.intercalate "\n" $ t' : ls
-    | isRule t = yield $ Right BlockRule
-    | isHtmlStart t = do
-        ls <- takeTill (T.null . T.strip) >+> CL.consume
-        yield $ Right $ BlockHtml $ T.intercalate "\n" $ t : ls
-    | Just (ltype, t') <- listStart t = do
-        let t'' = T.dropWhile (== ' ') t'
-        let leader = T.length t - T.length t''
-        ls <- getIndented leader >+> CL.consume
-        let blocks = runIdentity $ mapM_ yield (t'' : ls) $$ toBlocksLines =$ CL.consume
-        yield $ Right $ BlockList ltype $ Right blocks
-
-    | Just (x, y) <- getReference t = yield $ Right $ BlockReference x y
-
-    | otherwise = do
+    go LineRule = yield $ Right BlockRule
+    go (LineHtml t') = do
+        if t' `Set.member` msStandaloneHtml ms
+            then yield $ Right $ BlockHtml t'
+            else do
+                ls <- takeTill (T.null . T.strip) =$= CL.consume
+                yield $ Right $ BlockHtml $ T.intercalate "\n" $ t' : ls
+    go (LineList ltype t') = do
+        t2 <- CL.peek
+        case fmap (lineType ms) t2 of
+            -- If the next line is a non-indented text line, then we have a
+            -- lazy list.
+            Just (LineText t2') | T.null (T.takeWhile (== ' ') t2') -> do
+                CL.drop 1
+                -- Get all of the non-indented lines.
+                let loop front = do
+                        x <- await
+                        case x of
+                            Nothing -> return $ front []
+                            Just y ->
+                                case lineType ms y of
+                                    LineText z -> loop (front . (z:))
+                                    _ -> leftover y >> return (front [])
+                ls <- loop (\rest -> T.dropWhile (== ' ') t' : t2' : rest)
+                yield $ Right $ BlockList ltype $ Right [BlockPara $ T.intercalate "\n" ls]
+            -- If the next line is an indented list, then we have a sublist. I
+            -- disagree with this interpretation of Markdown, but it's the way
+            -- that Github implements things, so we will too.
+            _ | Just t2' <- t2
+              , Just t2'' <- T.stripPrefix "    " t2'
+              , LineList _ltype' _t2''' <- lineType ms t2'' -> do
+                ls <- getIndented 4 =$= CL.consume
+                let blocks = runIdentity $ mapM_ yield ls $$ toBlocksLines ms =$ CL.consume
+                let addPlainText
+                        | T.null $ T.strip t' = id
+                        | otherwise = (BlockPlainText (T.strip t'):)
+                yield $ Right $ BlockList ltype $ Right $ addPlainText blocks
+            _ -> do
+                let t'' = T.dropWhile (== ' ') t'
+                let leader = T.length t - T.length t''
+                ls <- getIndented leader =$= CL.consume
+                let blocks = runIdentity $ mapM_ yield (t'' : ls) $$ toBlocksLines ms =$ CL.consume
+                yield $ Right $ BlockList ltype $ Right blocks
+    go (LineReference x y) = yield $ Right $ BlockReference x y
+    go (LineText t') = do
         -- Check for underline headings
+        let getUnderline :: Text -> Maybe Int
+            getUnderline s
+                | T.length s < 2 = Nothing
+                | T.all (== '=') s = Just 1
+                | T.all (== '-') s = Just 2
+                | otherwise = Nothing
         t2 <- CL.peek
         case t2 >>= getUnderline of
+            Just level -> do
+                CL.drop 1
+                yield $ Right $ BlockHeading level t'
             Nothing -> do
                 let listStartIndent x =
                         case listStart x of
                             Just (_, y) -> T.take 2 y == "  "
                             Nothing -> False
-                (mfinal, ls) <- takeTill (\x -> T.null (T.strip x) || listStartIndent x) >+> withUpstream CL.consume
+                    isNonPara LineBlank = True
+                    isNonPara LineFenced{} = True
+                    isNonPara _ = False
+                (mfinal, ls) <- takeTillConsume (\x -> isNonPara (lineType ms x) || listStartIndent x)
                 maybe (return ()) leftover mfinal
-                yield $ Right $ BlockPara $ T.intercalate "\n" $ t : ls
-            Just level -> do
-                CL.drop 1
-                yield $ Right $ BlockHeading level t
+                yield $ Right $ BlockPara $ T.intercalate "\n" $ t' : ls
 
 isHtmlStart :: T.Text -> Bool
 isHtmlStart t =
     case T.stripPrefix "<" t of
         Nothing -> False
         Just t' ->
-            let (name, rest) = T.break (\c -> c `elem` " >/") t'
+            let (name, rest) = T.break (\c -> c `elem` " >") t'
              in T.all isValidTagName name &&
                 not (T.null name) &&
                 (not ("/" `T.isPrefixOf` rest) || ("/>" `T.isPrefixOf` rest))
@@ -164,13 +251,26 @@ isHtmlStart t =
         ('0' <= c && c <= '9') ||
         (c == '-') ||
         (c == '_') ||
+        (c == '/') ||
         (c == '!')
 
-takeTill :: Monad m => (i -> Bool) -> Pipe l i i u m (Maybe i)
+takeTill :: Monad m => (i -> Bool) -> Conduit i m i
 takeTill f =
     loop
   where
-    loop = await >>= maybe (return Nothing) (\x -> if f x then return (Just x) else yield x >> loop)
+    loop = await >>= maybe (return ()) (\x -> if f x then return () else yield x >> loop)
+
+--takeTillConsume :: Monad m => (i -> Bool) -> Consumer i m (Maybe i, [i])
+takeTillConsume f =
+    loop id
+  where
+    loop front = await >>= maybe
+        (return (Nothing, front []))
+        (\x ->
+            if f x
+                then return (Just x, front [])
+                else loop (front . (x:))
+        )
 
 listStart :: Text -> Maybe (ListType, Text)
 listStart t0
@@ -197,7 +297,7 @@ stripSeparator x =
         Just (')', y) -> Just y
         _ -> Nothing
 
-getIndented :: Monad m => Int -> GLConduit Text m Text
+getIndented :: Monad m => Int -> Conduit Text m Text
 getIndented leader =
     go []
   where
@@ -213,45 +313,12 @@ getIndented leader =
       where
         (x, y) = T.splitAt leader t
 
-takeQuotes :: Monad m => GLConduit Text m Text
+takeQuotes :: Monad m => Conduit Text m Text
 takeQuotes =
     await >>= maybe (return ()) go
   where
+    go "" = return ()
     go ">" = yield "" >> takeQuotes
     go t
         | Just t' <- T.stripPrefix "> " t = yield t' >> takeQuotes
-        | otherwise = leftover t
-
-isRule :: Text -> Bool
-isRule =
-    go . T.strip
-  where
-    go "* * *" = True
-    go "***" = True
-    go "*****" = True
-    go "- - -" = True
-    go "---" = True
-    go "___" = True
-    go "_ _ _" = True
-    go t = T.length (T.takeWhile (== '-') t) >= 5
-
-stripHeading :: Text -> Maybe (Int, Text)
-stripHeading t
-    | T.null x = Nothing
-    | otherwise = Just (T.length x, T.strip $ T.dropWhileEnd (== '#') y)
-  where
-    (x, y) = T.span (== '#') t
-
-getUnderline :: Text -> Maybe Int
-getUnderline t
-    | T.length t < 2 = Nothing
-    | T.all (== '=') t = Just 1
-    | T.all (== '-') t = Just 2
-    | otherwise = Nothing
-
-getReference :: Text -> Maybe (Text, Text)
-getReference a = do
-    b <- T.stripPrefix "[" $ T.dropWhile (== ' ') a
-    let (name, c) = T.break (== ']') b
-    d <- T.stripPrefix "]:" c
-    Just (name, T.strip d)
+        | otherwise = yield t >> takeQuotes

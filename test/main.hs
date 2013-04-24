@@ -6,6 +6,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import Text.Blaze.Html.Renderer.Text (renderHtml)
 import Control.Monad (forM_)
+import qualified Data.Set as Set
+import qualified Data.Map as Map
 
 import qualified Filesystem.Path.CurrentOS as F
 import qualified Filesystem as F
@@ -15,6 +17,9 @@ import Inline
 
 check :: Text -> Text -> Expectation
 check html md = renderHtml (markdown def md) `shouldBe` html
+
+checkSet :: MarkdownSettings -> Text -> Text -> Expectation
+checkSet set html md = renderHtml (markdown set md) `shouldBe` html
 
 check' :: Text -> Text -> Expectation
 check' html md = renderHtml (markdown def { msXssProtect = False } md) `shouldBe` html
@@ -85,7 +90,7 @@ main = do
 
         let close2 = "<div>foo\nbar\nbaz\n\nparagraph"
         it "autoclose 2"
-            $ check "<div>foo\nbar\nbaz</div><p>paragraph</p>" close2
+            $ check "<div>foo\nbar\nbaz<p>paragraph</p></div>" close2
     describe "inline code" $ do
         it "simple"
             $ check "<p>foo <code>bar</code> baz</p>" "foo `bar` baz"
@@ -184,6 +189,19 @@ main = do
         it "block" $ check "<div>hello world</div>" "<div>hello world</div>"
         it "block xss" $ check "alert('evil')" "<script>alert('evil')</script>"
         it "should be escaped" $ check "<p>1 &lt; 2</p>" "1 < 2"
+        it "standalone" $ checkSet
+            def { msStandaloneHtml = Set.fromList ["<hidden>", "</hidden>"], msXssProtect = False }
+            "<hidden><pre><code class=\"haskell\">foo\nbar</code></pre></hidden>"
+            "<hidden>\n```haskell\nfoo\nbar\n```\n</hidden>\n"
+    describe "fencing" $ do
+        it "custom fencing" $ checkSet
+            def
+                { msFencedHandlers = Map.union
+                    (htmlFencedHandler "@@@" (\clazz -> T.concat ["<article class=\"", clazz, "\">"]) (const "</article>"))
+                    (msFencedHandlers def)
+                }
+            "<article class=\"someclass\"><p>foo</p><blockquote><p>bar</p></blockquote></article>"
+            "@@@ someclass\nfoo\n\n> bar\n@@@"
     describe "examples" $ sequence_ examples
     describe "John Gruber's test suite" $ sequence_ gruber
 

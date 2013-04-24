@@ -1,21 +1,28 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RankNTypes #-}
 module Text.Markdown
     ( -- * Functions
       markdown
       -- * Settings
     , MarkdownSettings
     , msXssProtect
+    , msStandaloneHtml
+    , msFencedHandlers
     , msBlockLimit
       -- * Newtype
     , Markdown (..)
+      -- * Fenced handlers
+    , FencedHandler (..)
+    , codeFencedHandler
+    , htmlFencedHandler
       -- * Convenience re-exports
     , def
     ) where
 
 import Text.Markdown.Inline
 import Text.Markdown.Block
+import Text.Markdown.Types
 import Prelude hiding (sequence, takeWhile)
 import Data.Default (Default (..))
 import Data.Text (Text)
@@ -31,23 +38,6 @@ import qualified Text.Blaze.Html5.Attributes as HA
 import Text.HTML.SanitizeXSS (sanitizeBalance)
 import qualified Data.Map as Map
 import Data.String (IsString)
-
--- | A settings type providing various configuration options.
---
--- See <http://www.yesodweb.com/book/settings-types> for more information on
--- settings types. In general, you can use @def@.
-data MarkdownSettings = MarkdownSettings
-    { msXssProtect :: Bool
-      -- ^ Whether to automatically apply XSS protection to embedded HTML. Default: @True@.
-    , msBlockLimit :: Maybe Int
-      -- ^ Whether to limit the number of blocks that are rendered. Useful for document previews.
-    }
-
-instance Default MarkdownSettings where
-    def = MarkdownSettings
-        { msXssProtect = True
-        , msBlockLimit = Nothing
-        }
 
 -- | A newtype wrapper providing a @ToHtml@ instance.
 newtype Markdown = Markdown TL.Text
@@ -66,11 +56,16 @@ instance ToMarkup Markdown where
 -- >>> renderHtml $ markdown def { msXssProtect = False } "<script>alert('evil')</script>"
 -- "<script>alert('evil')</script>"
 markdown :: MarkdownSettings -> TL.Text -> Html
-markdown ms tl = runIdentity
+markdown ms tl =
+       sanitize
+     $ runIdentity
      $ CL.sourceList blocksH
     $= toHtmlB ms
     $$ CL.fold mappend mempty
   where
+    sanitize
+        | msXssProtect ms = preEscapedToMarkup . sanitizeBalance . TL.toStrict . renderHtml
+        | otherwise = id
     fixBlock :: Block Text -> Block Html
     fixBlock = fmap $ toHtmlI ms . toInline refs
 
@@ -80,7 +75,7 @@ markdown ms tl = runIdentity
     blocks :: [Block Text]
     blocks = runIdentity
            $ CL.sourceList (TL.toChunks tl)
-          $$ toBlocks
+          $$ toBlocks ms
           =$ CL.consume
 
     refs =
@@ -91,12 +86,12 @@ markdown ms tl = runIdentity
 
 data MState = NoState | InList ListType
 
-toHtmlB :: Monad m => MarkdownSettings -> GInfConduit (Block Html) m Html
+toHtmlB :: Monad m => MarkdownSettings -> Conduit (Block Html) m Html
 toHtmlB ms =
     loop NoState
   where
-    loop state = awaitE >>= either
-        (\e -> closeState state >> return e)
+    loop state = await >>= maybe
+        (closeState state)
         (\x -> do
             state' <- getState state x
             yield $ go x
@@ -119,9 +114,10 @@ toHtmlB ms =
     getState state@(InList _) _ = closeState state >> return NoState
 
     go (BlockPara h) = H.p h
+    go (BlockPlainText h) = h
     go (BlockList _ (Left h)) = H.li h
     go (BlockList _ (Right bs)) = H.li $ blocksToHtml bs
-    go (BlockHtml t) = escape $ (if msXssProtect ms then sanitizeBalance else id) t
+    go (BlockHtml t) = escape t
     go (BlockCode Nothing t) = H.pre $ H.code $ toMarkup t
     go (BlockCode (Just lang) t) = H.pre $ H.code H.! HA.class_ (H.toValue lang) $ toMarkup t
     go (BlockQuote bs) = H.blockquote $ blocksToHtml bs
